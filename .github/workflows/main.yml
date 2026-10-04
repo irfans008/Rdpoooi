@@ -1,0 +1,181 @@
+name: Secure Fast RDP with Tailscale
+
+on:
+  workflow_dispatch:
+
+jobs:
+  configure-rdp:
+    runs-on: windows-2022
+    timeout-minutes: 350
+
+    steps:
+      - name: Configure Windows RDP
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # Enable Remote Desktop
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name "fDenyTSConnections" `
+            -Type DWord `
+            -Value 0
+
+          # Require Network Level Authentication
+          Set-ItemProperty `
+            -Path "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name "UserAuthentication" `
+            -Type DWord `
+            -Value 1
+
+          # Enable Windows Firewall rules for RDP
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Make RDP service automatic and running
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "RDP configured successfully."
+
+      - name: Optimize RDP for lower bandwidth
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rdp = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          if (-not (Test-Path $rdp)) {
+            New-Item -Path $rdp -Force | Out-Null
+          }
+
+          # Disable desktop wallpaper
+          New-ItemProperty -Path $rdp -Name "fDisableWallpaper" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable full-window drag
+          New-ItemProperty -Path $rdp -Name "fDisableFullWindowDrag" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable menu/window animation
+          New-ItemProperty -Path $rdp -Name "fDisableMenuAnim" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable font smoothing
+          New-ItemProperty -Path $rdp -Name "fDisableFontSmoothing" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable themes
+          New-ItemProperty -Path $rdp -Name "fDisableThemes" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable unnecessary bitmap caching
+          New-ItemProperty -Path $rdp -Name "BitmapCacheSize" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          Write-Host "RDP bandwidth optimizations applied."
+
+      - name: Disable unnecessary RDP redirection
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $rdp = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+
+          # Disable printer redirection
+          New-ItemProperty -Path $rdp -Name "fDisableCpm" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable drive redirection
+          New-ItemProperty -Path $rdp -Name "fDisableCdm" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable clipboard redirection
+          New-ItemProperty -Path $rdp -Name "fDisableClip" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          # Disable audio recording redirection
+          New-ItemProperty -Path $rdp -Name "fDisableAudioCapture" `
+            -PropertyType DWord -Value 1 -Force | Out-Null
+
+          Write-Host "Unnecessary RDP redirection disabled."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = "$env:TEMP\tailscale-setup.exe"
+
+          Invoke-WebRequest `
+            -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" `
+            -OutFile $installer
+
+          Start-Process `
+            -FilePath $installer `
+            -ArgumentList "/quiet" `
+            -Wait
+
+          Write-Host "Tailscale installed."
+
+      - name: Connect to Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "TAILSCALE_AUTHKEY GitHub Secret is missing."
+          }
+
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            throw "Tailscale executable was not found."
+          }
+
+          & $tailscale up `
+            --auth-key="$env:TAILSCALE_AUTHKEY" `
+            --accept-dns=true
+
+          Write-Host "Tailscale connected."
+
+      - name: Display Tailscale RDP address
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          Write-Host ""
+          Write-Host "===== TAILSCALE STATUS ====="
+          & $tailscale status
+
+          Write-Host ""
+          Write-Host "===== TAILSCALE IP ====="
+          & $tailscale ip -4
+
+          Write-Host ""
+          Write-Host "Use the displayed Tailscale IPv4 address in your RDP client."
+          Write-Host "Do NOT expose TCP 3389 directly to the public Internet."
+
+      - name: Restart Remote Desktop Service
+        shell: powershell
+        run: |
+          Restart-Service -Name TermService -Force
+          Write-Host "Remote Desktop service restarted."
+
+      - name: Final verification
+        shell: powershell
+        run: |
+          Write-Host "===== RDP SERVICE ====="
+          Get-Service TermService | Select-Object Name, Status, StartType
+
+          Write-Host ""
+          Write-Host "===== RDP PORT ====="
+          Get-NetTCPConnection -LocalPort 3389 -State Listen -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, State
+
+          Write-Host ""
+          Write-Host "===== FIREWALL ====="
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Where-Object Enabled -eq "True" |
+            Select-Object DisplayName, Enabled, Profile
